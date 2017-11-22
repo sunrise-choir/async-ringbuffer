@@ -18,7 +18,7 @@ use std::io::{Read, Write, Error};
 use std::io::ErrorKind::WouldBlock;
 use std::ptr::copy_nonoverlapping;
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 use tokio_io::{AsyncRead, AsyncWrite};
 use futures::{Poll, Async};
@@ -44,7 +44,7 @@ pub fn ring_buffer(capacity: usize) -> (Writer, Reader) {
                                       task: None,
                                   }));
 
-    (Writer(Rc::downgrade(&rb)), Reader(rb))
+    (Writer(Rc::clone(&rb)), Reader(rb))
 }
 
 struct RingBuffer {
@@ -83,117 +83,77 @@ impl RingBuffer {
     }
 }
 
-impl Read for RingBuffer {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        if buf.len() == 0 {
-            return Ok(0);
-        }
-
-        let capacity = self.data.capacity();
-        let start = self.data.as_mut_slice().as_mut_ptr();
-        let end = unsafe { start.offset(capacity as isize) }; // end itself is 1 byte outside the buffer
-
-        if self.amount == 0 {
-            return Err(self.park());
-        }
-
-        let buf_ptr = buf.as_mut_ptr();
-        let read_total = min(buf.len(), self.amount);
-
-        if (unsafe { self.read.offset(read_total as isize) } as *const u8) < end {
-            // non-wrapping case
-            unsafe { copy_nonoverlapping(self.read, buf_ptr, read_total) };
-
-            self.read = unsafe { self.read.offset(read_total as isize) };
-            self.amount -= read_total;
-        } else {
-            // wrapping case
-            let distance_re = self.read.offset_to(end).unwrap() as usize;
-            let remaining: usize = read_total - distance_re;
-
-            unsafe { copy_nonoverlapping(self.read, buf_ptr, distance_re) };
-            unsafe { copy_nonoverlapping(start, buf_ptr.offset(distance_re as isize), remaining) };
-
-            self.read = unsafe { start.offset(remaining as isize) };
-            self.amount -= read_total;
-        }
-
-        debug_assert!(self.read >= start);
-        debug_assert!(self.read < end);
-        debug_assert!(self.amount <= capacity);
-
-        self.unpark();
-        return Ok(read_total);
-    }
-}
-
-impl Write for RingBuffer {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        if buf.len() == 0 {
-            return Ok(0);
-        }
-
-        let capacity = self.data.capacity();
-        let start = self.data.as_mut_slice().as_mut_ptr();
-        let end = unsafe { start.offset(capacity as isize) }; // end itself is 1 byte outside the buffer
-
-        if self.amount == capacity {
-            return Err(self.park());
-        }
-
-        let buf_ptr = buf.as_ptr();
-        let write_total = min(buf.len(), capacity - self.amount);
-
-        if (unsafe { self.write_ptr().offset(write_total as isize) } as *const u8) < end {
-            // non-wrapping case
-            unsafe { copy_nonoverlapping(buf_ptr, self.write_ptr(), write_total) };
-
-            self.amount += write_total;
-        } else {
-            // wrapping case
-            let distance_we = self.write_ptr().offset_to(end).unwrap() as usize;
-            let remaining: usize = write_total - distance_we;
-
-            unsafe { copy_nonoverlapping(buf_ptr, self.write_ptr(), distance_we) };
-            unsafe { copy_nonoverlapping(buf_ptr.offset(distance_we as isize), start, remaining) };
-
-            self.amount += write_total;
-        }
-
-        debug_assert!(self.read >= start);
-        debug_assert!(self.read < end);
-        debug_assert!(self.amount <= capacity);
-
-        self.unpark();
-        return Ok(write_total);
-    }
-
-    fn flush(&mut self) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
 /// Write access to a nonblocking ring buffer with fixed capacity.
 ///
 /// If there is no space in the buffer to write to, the current task is parked
 /// and notified once space becomes available.
-pub struct Writer(Weak<RefCell<RingBuffer>>);
+pub struct Writer(Rc<RefCell<RingBuffer>>);
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.0.borrow_mut().unpark();
+    }
+}
 
 /// Nonblocking `Write` implementation.
 impl Write for Writer {
-    /// Write data to the RingBuffer. This returns `Ok(0)` if and only if
-    /// `buf.len() == 0`. The only error this may return is of kind `WouldBlock`.
-    /// When this returns a `WouldBlock` error, the current task is parked and
-    /// gets notified once more space becomes available in the buffer.
+    /// Write data to the RingBuffer. The only error this may return is of kind
+    /// `WouldBlock`. When this returns a `WouldBlock` error, the current task
+    /// is parked and gets notified once more space becomes available in the
+    /// buffer.
+    ///
+    /// This returns only returns `Ok(0)` if either `buf.len() == 0`, or if the
+    /// corresponding Reader has been dropped and no more data will be read to
+    /// free up space for new data. If the Writer task is parked while the
+    /// Reader is dropped, the task gets notified.
     ///
     /// If a previous call to `read` returned a `WouldBlock` error, the
     /// corresponding `Reader` is unparked if data was written in this `write`
     /// call.
     fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        match self.0.upgrade() {
-            Some(rb) => rb.borrow_mut().write(buf),
-            None => unreachable!(),
+        let mut rb = self.0.borrow_mut();
+
+        if buf.len() == 0 {
+            return Ok(0);
         }
+
+        let capacity = rb.data.capacity();
+        let start = rb.data.as_mut_slice().as_mut_ptr();
+        let end = unsafe { start.offset(capacity as isize) }; // end itself is 1 byte outside the buffer
+
+        if rb.amount == capacity {
+            if Rc::strong_count(&self.0) == 1 {
+                return Ok(0);
+            } else {
+                return Err(rb.park());
+            }
+        }
+
+        let buf_ptr = buf.as_ptr();
+        let write_total = min(buf.len(), capacity - rb.amount);
+
+        if (unsafe { rb.write_ptr().offset(write_total as isize) } as *const u8) < end {
+            // non-wrapping case
+            unsafe { copy_nonoverlapping(buf_ptr, rb.write_ptr(), write_total) };
+
+            rb.amount += write_total;
+        } else {
+            // wrapping case
+            let distance_we = rb.write_ptr().offset_to(end).unwrap() as usize;
+            let remaining: usize = write_total - distance_we;
+
+            unsafe { copy_nonoverlapping(buf_ptr, rb.write_ptr(), distance_we) };
+            unsafe { copy_nonoverlapping(buf_ptr.offset(distance_we as isize), start, remaining) };
+
+            rb.amount += write_total;
+        }
+
+        debug_assert!(rb.read >= start);
+        debug_assert!(rb.read < end);
+        debug_assert!(rb.amount <= capacity);
+
+        rb.unpark();
+        return Ok(write_total);
     }
 
     fn flush(&mut self) -> Result<(), Error> {
@@ -213,18 +173,72 @@ impl AsyncWrite for Writer {
 /// and notified once space becomes available.
 pub struct Reader(Rc<RefCell<RingBuffer>>);
 
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.0.borrow_mut().unpark();
+    }
+}
+
 /// Nonblocking `Read` implementation.
 impl Read for Reader {
-    /// Read data from the RingBuffer. This returns `Ok(0)` if and only if
-    /// `buf.len() == 0`. The only error this may return is of kind `WouldBlock`.
+    /// Read data from the RingBuffer. The only error this may return is of kind `WouldBlock`.
     /// When this returns a `WouldBlock` error, the current task is parked and
     /// gets notified once more data becomes available the buffer.
+    ///
+    /// This returns only returns `Ok(0)` if either `buf.len() == 0`, or if the
+    /// corresponding Writer has been dropped and no new data will become
+    /// available. If the Reader task is parked while the Writer is dropped, the
+    /// task gets notified.
     ///
     /// If a previous call to `write` returned a `WouldBlock` error, the
     /// corresponding `Writer` is unparked if data was written in this `read`
     /// call.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        self.0.borrow_mut().read(buf)
+        let mut rb = self.0.borrow_mut();
+
+        if buf.len() == 0 {
+            return Ok(0);
+        }
+
+        let capacity = rb.data.capacity();
+        let start = rb.data.as_mut_slice().as_mut_ptr();
+        let end = unsafe { start.offset(capacity as isize) }; // end itself is 1 byte outside the buffer
+
+        if rb.amount == 0 {
+            if Rc::strong_count(&self.0) == 1 {
+                return Ok(0);
+            } else {
+                return Err(rb.park());
+            }
+        }
+
+        let buf_ptr = buf.as_mut_ptr();
+        let read_total = min(buf.len(), rb.amount);
+
+        if (unsafe { rb.read.offset(read_total as isize) } as *const u8) < end {
+            // non-wrapping case
+            unsafe { copy_nonoverlapping(rb.read, buf_ptr, read_total) };
+
+            rb.read = unsafe { rb.read.offset(read_total as isize) };
+            rb.amount -= read_total;
+        } else {
+            // wrapping case
+            let distance_re = rb.read.offset_to(end).unwrap() as usize;
+            let remaining: usize = read_total - distance_re;
+
+            unsafe { copy_nonoverlapping(rb.read, buf_ptr, distance_re) };
+            unsafe { copy_nonoverlapping(start, buf_ptr.offset(distance_re as isize), remaining) };
+
+            rb.read = unsafe { start.offset(remaining as isize) };
+            rb.amount -= read_total;
+        }
+
+        debug_assert!(rb.read >= start);
+        debug_assert!(rb.read < end);
+        debug_assert!(rb.amount <= capacity);
+
+        rb.unpark();
+        return Ok(read_total);
     }
 }
 
@@ -237,6 +251,7 @@ mod tests {
 
     use quickcheck::{QuickCheck, StdGen, Gen, Arbitrary};
     use futures::{Future, Async};
+    use futures::future::poll_fn;
     use void::Void;
     use rand;
     use rand::Rng;
@@ -552,8 +567,91 @@ mod tests {
 
         return true;
     }
-}
 
-// TODO test for signalling dropping of the Reader/Writer by having write/read return Ok(0) (notifies the non-dropped component if it is currently parked)
-// TODO implement drop signalling
-// TODO update documentation to reflect drop signalling
+    #[test]
+    // If the reader has been dropped, writes will return Ok(0) once the buffer
+    // is full.
+    fn test_dropped_reader() {
+        let mut writer;
+        {
+            let (w, _) = ring_buffer(8);
+            writer = w;
+        }
+        assert_eq!(writer.write(&[0, 1, 2, 3, 4]).unwrap(), 5);
+        assert_eq!(writer.write(&[5, 6, 7, 8, 9]).unwrap(), 3);
+        assert_eq!(writer.write(&[8, 9]).unwrap(), 0);
+        assert_eq!(writer.write(&[8, 9]).unwrap(), 0);
+    }
+
+    #[test]
+    // If the reader is dropped while the writer is parked, the writer is
+    // notified and further writes return Ok(0).
+    fn test_dropped_reader_notify() {
+        let mut writer = None;
+        let mut blocked = false;
+        assert_eq!(poll_fn::<(), Void, _>(|| if !blocked {
+                                              let (mut w, mut r) = ring_buffer(8);
+                                              assert_eq!(w.write(&[0, 1, 2, 3, 4, 5, 6, 7])
+                                                             .unwrap(),
+                                                         8);
+                                              let _ = w.write(&[8, 9]).unwrap_err();
+                                              blocked = true;
+                                              writer = Some(w);
+                                              let _ = r.read(&mut []); // use r so that drop does not get moved to an earlier point
+                                              return Ok(Async::NotReady);
+                                          } else {
+                                              let mut w = writer.take().unwrap();
+                                              assert_eq!(w.write(&[8, 9]).unwrap(), 0);
+                                              assert_eq!(w.write(&[8, 9]).unwrap(), 0);
+                                              return Ok(Async::Ready(()));
+                                          })
+                           .wait()
+                           .unwrap(),
+                   ());
+    }
+
+    #[test]
+    // If the writer has been dropped, reads will return Ok(0) once all data
+    // has been read.
+    fn test_dropped_writer() {
+        let mut reader;
+        {
+            let (mut w, r) = ring_buffer(8);
+            assert_eq!(w.write(&[0, 1, 2, 3, 4, 5, 6, 7]).unwrap(), 8);
+            reader = r;
+        }
+        let mut foo = [0u8; 8];
+        assert_eq!(reader.read(&mut foo[0..5]).unwrap(), 5);
+        assert_eq!(reader.read(&mut foo[5..8]).unwrap(), 3);
+        assert_eq!(reader.read(&mut foo[0..8]).unwrap(), 0);
+        assert_eq!(reader.read(&mut foo[0..8]).unwrap(), 0);
+    }
+
+    #[test]
+    // If the writer is dropped while the reader is parked, the reader is
+    // notified and further reads return Ok(0).
+    fn test_dropped_writer_notify() {
+        let mut reader = None;
+        let mut blocked = false;
+        assert_eq!(poll_fn::<(), Void, _>(|| if !blocked {
+                                              let (mut w, mut r) = ring_buffer(8); // must give writer a name, or dropping optimized to an earlier point
+                                              let mut foo = [0u8; 8];
+
+                                              let _ = r.read(&mut foo[0..5]).unwrap_err();
+                                              blocked = true;
+                                              reader = Some(r);
+                                              let _ = w.write(&[]); // use w so that drop does not get moved to an earlier point
+                                              return Ok(Async::NotReady);
+                                          } else {
+                                              let mut r = reader.take().unwrap();
+                                              let mut foo = [0u8; 8];
+
+                                              assert_eq!(r.read(&mut foo[0..5]).unwrap(), 0);
+                                              assert_eq!(r.read(&mut foo[0..5]).unwrap(), 0);
+                                              return Ok(Async::Ready(()));
+                                          })
+                           .wait()
+                           .unwrap(),
+                   ());
+    }
+}
