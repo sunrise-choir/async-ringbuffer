@@ -66,7 +66,6 @@ impl RingBuffer {
         self.task.take().map(|task| task.notify());
     }
 
-    // TODO when to use this?
     fn write_ptr(&mut self) -> *mut u8 {
         unsafe {
             let start = self.data.as_mut_slice().as_mut_ptr();
@@ -86,9 +85,7 @@ impl RingBuffer {
 
 impl Read for RingBuffer {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        println!("called read");
         if buf.len() == 0 {
-            println!("read received empty buffer");
             return Ok(0);
         }
 
@@ -97,32 +94,20 @@ impl Read for RingBuffer {
         let end = unsafe { start.offset(capacity as isize) }; // end itself is 1 byte outside the buffer
 
         if self.amount == 0 {
-            println!("parked in read");
             return Err(self.park());
         }
 
         let buf_ptr = buf.as_mut_ptr();
         let read_total = min(buf.len(), self.amount);
 
-        println!("read status: capacity = {}, start = {:?}, end = {:?}, amount = {}, read_total = {}",
-                 capacity,
-                 start,
-                 end,
-                 self.amount,
-                 read_total);
-        println!("read: read = {:?}, amount = {:?}", self.read, self.amount);
-
-
         if (unsafe { self.read.offset(read_total as isize) } as *const u8) < end {
             // non-wrapping case
-            println!("read: nonwrapping");
             unsafe { copy_nonoverlapping(self.read, buf_ptr, read_total) };
 
             self.read = unsafe { self.read.offset(read_total as isize) };
             self.amount -= read_total;
         } else {
             // wrapping case
-            println!("read: wrapping");
             let distance_re = self.read.offset_to(end).unwrap() as usize;
             let remaining: usize = read_total - distance_re;
 
@@ -132,9 +117,6 @@ impl Read for RingBuffer {
             self.read = unsafe { start.offset(remaining as isize) };
             self.amount -= read_total;
         }
-        println!("read new status: read = {:?}, amount = {:?}",
-                 self.read,
-                 self.amount);
 
         debug_assert!(self.read >= start);
         debug_assert!(self.read < end);
@@ -147,9 +129,7 @@ impl Read for RingBuffer {
 
 impl Write for RingBuffer {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        println!("called write");
         if buf.len() == 0 {
-            println!("write received empty buffer");
             return Ok(0);
         }
 
@@ -158,26 +138,19 @@ impl Write for RingBuffer {
         let end = unsafe { start.offset(capacity as isize) }; // end itself is 1 byte outside the buffer
 
         if self.amount == capacity {
-            println!("parked in write");
             return Err(self.park());
         }
 
         let buf_ptr = buf.as_ptr();
         let write_total = min(buf.len(), capacity - self.amount);
 
-        println!("write status: capacity = {}, start = {:?}, end = {:?}, amount = {}, write_total = {}",
-                 capacity,
-                 start,
-                 end,
-                 self.amount,
-                 write_total);
-        println!("write: read = {:?}, amount = {:?}", self.read, self.amount);
-
         if (unsafe { self.write_ptr().offset(write_total as isize) } as *const u8) < end {
+            // non-wrapping case
             unsafe { copy_nonoverlapping(buf_ptr, self.write_ptr(), write_total) };
 
             self.amount += write_total;
         } else {
+            // wrapping case
             let distance_we = self.write_ptr().offset_to(end).unwrap() as usize;
             let remaining: usize = write_total - distance_we;
 
@@ -186,9 +159,6 @@ impl Write for RingBuffer {
 
             self.amount += write_total;
         }
-        println!("write new status: read = {:?}, amount = {:?}",
-                 self.read,
-                 self.amount);
 
         debug_assert!(self.read >= start);
         debug_assert!(self.read < end);
@@ -305,22 +275,16 @@ mod tests {
 
         fn step(&mut self) -> Option<usize> {
             let len = self.buf_sizes.pop().unwrap_or(5);
-            println!("");
-            println!("WriteAll poll with {} buffer", len);
             match self.buf
                       .write(&self.data[self.offset..min(self.offset + len, self.data.len())]) {
                 Err(e) => {
                     if e.kind() == WouldBlock {
-                        println!("WriteAll returns NotReady");
                         return None;
                     } else {
                         panic!("RingBuffer returned error other than WouldBlock");
                     }
                 }
                 Ok(written) => {
-                    println!("WriteAll wrote {}, new offset is {}",
-                             written,
-                             self.offset + written);
                     self.offset += written;
                     return Some(written);
                 }
@@ -366,22 +330,16 @@ mod tests {
         fn step(&mut self) -> Option<usize> {
             let len = self.buf_sizes.pop().unwrap_or(5);
             let end = self.data.len();
-            println!("");
-            println!("ReadAll poll with {} buffer", len);
             match self.buf
                       .read(&mut self.data[self.offset..min(self.offset + len, end)]) {
                 Err(e) => {
                     if e.kind() == WouldBlock {
-                        println!("ReadAll returns NotReady");
                         return None;
                     } else {
                         panic!("RingBuffer returned error other than WouldBlock");
                     }
                 }
                 Ok(read) => {
-                    println!("ReadAll read {}, new offset is {}",
-                             read,
-                             self.offset + read);
                     self.offset += read;
                     return Some(read);
                 }
@@ -595,3 +553,7 @@ mod tests {
         return true;
     }
 }
+
+// TODO test for signalling dropping of the Reader/Writer by having write/read return Ok(0) (notifies the non-dropped component if it is currently parked)
+// TODO implement drop signalling
+// TODO update documentation to reflect drop signalling
