@@ -1,0 +1,15 @@
+[package]
+name = "async-ringbuffer"
+version = "0.1.0"
+authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
+description = "A nonblocking spsc ring buffer with fixed capacity."
+readme = "README.md"
+license = "GPL-3.0"
+
+[dependencies]
+tokio-io = "0.1.2"
+futures = "0.1.17"
+
+[dev-dependencies]
+partial-io = { version = "0.2.5", features = ["quickcheck", "tokio"] }
+quickcheck = "0.4.1"
