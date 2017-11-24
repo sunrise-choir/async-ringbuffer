@@ -356,6 +356,7 @@ mod tests {
                 }
                 Ok(read) => {
                     self.offset += read;
+                    assert!((min(self.offset + len, end) == self.offset) || read != 0); // the ring buffer never returns 0 on read unless it was passed a 0-length buffer
                     return Some(read);
                 }
             }
