@@ -5,6 +5,7 @@ authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "A nonblocking spsc ring buffer with fixed capacity."
 readme = "README.md"
 license = "GPL-3.0"
+repository = "https://github.com/AljoschaMeyer/async-ringbuffer"
 
 [dependencies]
 tokio-io = "0.1.2"
