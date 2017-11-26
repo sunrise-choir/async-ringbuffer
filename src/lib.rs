@@ -42,6 +42,7 @@ pub fn ring_buffer(capacity: usize) -> (Writer, Reader) {
                                       read: ptr,
                                       amount: 0,
                                       task: None,
+                                      did_shutdown: false,
                                   }));
 
     (Writer(Rc::clone(&rb)), Reader(rb))
@@ -54,6 +55,7 @@ struct RingBuffer {
     // amount of valid data
     amount: usize,
     task: Option<Task>,
+    did_shutdown: bool,
 }
 
 impl RingBuffer {
@@ -102,10 +104,10 @@ impl Write for Writer {
     /// is parked and gets notified once more space becomes available in the
     /// buffer.
     ///
-    /// This returns only returns `Ok(0)` if either `buf.len() == 0`, or if the
-    /// corresponding Reader has been dropped and no more data will be read to
-    /// free up space for new data. If the Writer task is parked while the
-    /// Reader is dropped, the task gets notified.
+    /// This returns only returns `Ok(0)` if either `buf.len() == 0`, `shutdown`
+    /// has been called, or if the corresponding Reader has been dropped and no
+    /// more data will be read to free up space for new data. If the Writer task
+    /// is parked while the Reader is dropped, the task gets notified.
     ///
     /// If a previous call to `read` returned a `WouldBlock` error, the
     /// corresponding `Reader` is unparked if data was written in this `write`
@@ -113,7 +115,7 @@ impl Write for Writer {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
         let mut rb = self.0.borrow_mut();
 
-        if buf.len() == 0 {
+        if buf.len() == 0 || rb.did_shutdown {
             return Ok(0);
         }
 
@@ -162,7 +164,17 @@ impl Write for Writer {
 }
 
 impl AsyncWrite for Writer {
+    /// Once shutdown has been called, the corresponding reader will return
+    /// `Ok(0)` on `read` after all buffered data has been read. If the reader
+    /// is parked while this is called, it gets notified.
     fn shutdown(&mut self) -> Poll<(), Error> {
+        let mut rb = self.0.borrow_mut();
+
+        if !rb.did_shutdown {
+            rb.unpark(); // only unpark on first call, makes this method idempotent
+        }
+        rb.did_shutdown = true;
+
         Ok(Async::Ready(()))
     }
 }
@@ -185,7 +197,8 @@ impl Read for Reader {
     /// When this returns a `WouldBlock` error, the current task is parked and
     /// gets notified once more data becomes available the buffer.
     ///
-    /// This returns only returns `Ok(0)` if either `buf.len() == 0`, or if the
+    /// This returns only returns `Ok(0)` if either `buf.len() == 0`, `shutdown`
+    /// was called on the writer and all buffered data has been read, or if the
     /// corresponding Writer has been dropped and no new data will become
     /// available. If the Reader task is parked while the Writer is dropped, the
     /// task gets notified.
@@ -205,7 +218,7 @@ impl Read for Reader {
         let end = unsafe { start.offset(capacity as isize) }; // end itself is 1 byte outside the buffer
 
         if rb.amount == 0 {
-            if Rc::strong_count(&self.0) == 1 {
+            if Rc::strong_count(&self.0) == 1 || rb.did_shutdown {
                 return Ok(0);
             } else {
                 return Err(rb.park());
@@ -655,4 +668,55 @@ mod tests {
                            .unwrap(),
                    ());
     }
+
+    #[test]
+    // After calling `shutdown` on the writer, reads return Ok(0) once all data has
+    // been read.
+    fn test_shutdown_writer_reads() {
+        let (mut w, mut r) = ring_buffer(8);
+
+        assert_eq!(w.write(&[0, 1, 2, 3, 4, 5]).unwrap(), 6);
+        assert_eq!(w.shutdown().unwrap(), Async::Ready(()));
+
+        let mut foo = [0u8; 8];
+        assert_eq!(r.read(&mut foo[0..4]).unwrap(), 4);
+        assert_eq!(r.read(&mut foo[4..8]).unwrap(), 2);
+        assert_eq!(r.read(&mut foo[6..8]).unwrap(), 0);
+        assert_eq!(r.read(&mut foo[6..8]).unwrap(), 0);
+    }
+
+    #[test]
+    // If `shutdown` is called on the writer while the reader is parked, the reader
+    // is notified and further reads return Ok(0).
+    fn test_shutdown_writer_notify() {
+        let (mut w, mut r) = ring_buffer(8);
+        let mut foo = [0u8; 8];
+        let mut blocked = false;
+
+        assert_eq!(poll_fn::<(), Void, _>(|| if !blocked {
+                                              let _ = r.read(&mut foo[0..5]).unwrap_err();
+                                              blocked = true;
+                                              assert_eq!(w.shutdown().unwrap(), Async::Ready(()));
+                                              return Ok(Async::NotReady);
+                                          } else {
+                                              assert_eq!(r.read(&mut foo[0..5]).unwrap(), 0);
+                                              assert_eq!(r.read(&mut foo[0..5]).unwrap(), 0);
+                                              return Ok(Async::Ready(()));
+                                          })
+                           .wait()
+                           .unwrap(),
+                   ());
+    }
+
+    #[test]
+    // After calling `shutdown` on the writer, further writes return Ok(0).
+    fn test_shutdown_writer_writes() {
+        let (mut w, _) = ring_buffer(8);
+
+        assert_eq!(w.write(&[0, 1, 2, 3]).unwrap(), 4);
+        assert_eq!(w.shutdown().unwrap(), Async::Ready(()));
+        assert_eq!(w.write(&[4, 5, 6, 7]).unwrap(), 0);
+        assert_eq!(w.write(&[4, 5, 6, 7]).unwrap(), 0);
+    }
+
 }
