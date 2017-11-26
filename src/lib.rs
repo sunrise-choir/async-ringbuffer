@@ -719,4 +719,17 @@ mod tests {
         assert_eq!(w.write(&[4, 5, 6, 7]).unwrap(), 0);
     }
 
+    #[test]
+    #[should_panic]
+    /// Calling `ring_buffer` with capacity 0 panics
+    fn panic_on_capacity_0() {
+        let _ = ring_buffer(0);
+    }
+
+    #[test]
+    #[should_panic]
+    /// Calling `ring_buffer` with capacity (isize::max_value() as usize) + 1 panics
+    fn panic_on_capacity_too_large() {
+        let _ = ring_buffer((isize::max_value() as usize) + 1);
+    }
 }
