@@ -314,6 +314,8 @@ mod tests {
                 }
                 Ok(written) => {
                     self.offset += written;
+                    assert!((min(self.offset + len, self.data.len()) == self.offset) ||
+                            written != 0); // the ring buffer never returns 0 on write unless it was passed a 0-length buffer
                     return Some(written);
                 }
             }
