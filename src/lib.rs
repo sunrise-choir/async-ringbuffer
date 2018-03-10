@@ -182,7 +182,7 @@ impl AsyncWrite for Writer {
 /// Read access to a nonblocking ring buffer with fixed capacity.
 ///
 /// If there is no data in the buffer to read from, the current task is parked
-/// and notified once space becomes available.
+/// and notified once data becomes available.
 pub struct Reader(Rc<RefCell<RingBuffer>>);
 
 impl Drop for Reader {

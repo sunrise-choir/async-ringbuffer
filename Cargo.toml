@@ -4,7 +4,7 @@ version = "0.2.0"
 authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "A nonblocking spsc ring buffer with fixed capacity."
 readme = "README.md"
-license = "GPL-3.0"
+license = "AGPL-3.0"
 repository = "https://github.com/AljoschaMeyer/async-ringbuffer"
 
 [dependencies]
