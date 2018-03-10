@@ -3,26 +3,21 @@
 #![deny(missing_docs)]
 #![feature(offset_to)]
 
-extern crate futures;
-extern crate tokio_io;
+extern crate futures_core;
+extern crate futures_io;
 
 #[cfg(test)]
-extern crate quickcheck;
-#[cfg(test)]
-extern crate void;
-#[cfg(test)]
-extern crate rand;
+extern crate futures;
 
 use std::cmp::min;
-use std::io::{Read, Write, Error};
-use std::io::ErrorKind::WouldBlock;
 use std::ptr::copy_nonoverlapping;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use tokio_io::{AsyncRead, AsyncWrite};
-use futures::{Poll, Async};
-use futures::task::{Task, current};
+use futures_io::{AsyncRead, AsyncWrite, Error};
+use futures_core::{Poll, Async};
+use futures_core::task::{Context, Waker};
+use Async::{Ready, Pending};
 
 /// Creates a new RingBuffer with the given capacity, and returns a handle for
 /// writing and a handle for reading.
@@ -41,7 +36,7 @@ pub fn ring_buffer(capacity: usize) -> (Writer, Reader) {
                                       data,
                                       read: ptr,
                                       amount: 0,
-                                      task: None,
+                                      waker: None,
                                       did_shutdown: false,
                                   }));
 
@@ -54,18 +49,17 @@ struct RingBuffer {
     read: *mut u8,
     // amount of valid data
     amount: usize,
-    task: Option<Task>,
+    waker: Option<Waker>,
     did_shutdown: bool,
 }
 
 impl RingBuffer {
-    fn park(&mut self) -> Error {
-        self.task = Some(current());
-        return Error::new(WouldBlock, "");
+    fn park(&mut self, cx: &Context) {
+        self.waker = Some(cx.waker());
     }
 
-    fn unpark(&mut self) {
-        self.task.take().map(|task| task.notify());
+    fn wake(&mut self) {
+        self.waker.take().map(|w| w.wake());
     }
 
     fn write_ptr(&mut self) -> *mut u8 {
@@ -93,30 +87,24 @@ pub struct Writer(Rc<RefCell<RingBuffer>>);
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        self.0.borrow_mut().unpark();
+        self.0.borrow_mut().wake();
     }
 }
 
-/// Nonblocking `Write` implementation.
-impl Write for Writer {
-    /// Write data to the RingBuffer. The only error this may return is of kind
-    /// `WouldBlock`. When this returns a `WouldBlock` error, the current task
-    /// is parked and gets notified once more space becomes available in the
-    /// buffer.
+impl AsyncWrite for Writer {
+    /// Write data to the RingBuffer.
     ///
-    /// This returns only returns `Ok(0)` if either `buf.len() == 0`, `shutdown`
-    /// has been called, or if the corresponding Reader has been dropped and no
-    /// more data will be read to free up space for new data. If the Writer task
-    /// is parked while the Reader is dropped, the task gets notified.
+    /// This only returns `Ok(Ready(0))` if either `buf.len() == 0`, `poll_close` has been called,
+    /// or if the corresponding `Reader` has been dropped and no more data will be read to free up
+    /// space for new data.
     ///
-    /// If a previous call to `read` returned a `WouldBlock` error, the
-    /// corresponding `Reader` is unparked if data was written in this `write`
-    /// call.
-    fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+    /// # Errors
+    /// This never emits an error.
+    fn poll_write(&mut self, cx: &mut Context, buf: &[u8]) -> Poll<usize, Error> {
         let mut rb = self.0.borrow_mut();
 
         if buf.len() == 0 || rb.did_shutdown {
-            return Ok(0);
+            return Ok(Ready(0));
         }
 
         let capacity = rb.data.capacity();
@@ -125,9 +113,10 @@ impl Write for Writer {
 
         if rb.amount == capacity {
             if Rc::strong_count(&self.0) == 1 {
-                return Ok(0);
+                return Ok(Ready(0));
             } else {
-                return Err(rb.park());
+                rb.park(cx);
+                return Ok(Pending);
             }
         }
 
@@ -154,28 +143,30 @@ impl Write for Writer {
         debug_assert!(rb.read < end);
         debug_assert!(rb.amount <= capacity);
 
-        rb.unpark();
-        return Ok(write_total);
+        rb.wake();
+        return Ok(Ready(write_total));
     }
 
-    fn flush(&mut self) -> Result<(), Error> {
-        Ok(())
+    /// # Errors
+    /// This never emits an error.
+    fn poll_flush(&mut self, _: &mut Context) -> Poll<(), Error> {
+        Ok(Ready(()))
     }
-}
 
-impl AsyncWrite for Writer {
-    /// Once shutdown has been called, the corresponding reader will return
-    /// `Ok(0)` on `read` after all buffered data has been read. If the reader
-    /// is parked while this is called, it gets notified.
-    fn shutdown(&mut self) -> Poll<(), Error> {
+    /// Once closing is complete, the corresponding reader will always return `Ok(Ready(0))` on
+    /// `poll_read` once all remaining buffered data has been read.
+    ///
+    /// # Errors
+    /// This never emits an error.
+    fn poll_close(&mut self, _: &mut Context) -> Poll<(), Error> {
         let mut rb = self.0.borrow_mut();
 
         if !rb.did_shutdown {
-            rb.unpark(); // only unpark on first call, makes this method idempotent
+            rb.wake(); // only unpark on first call, makes this method idempotent
         }
         rb.did_shutdown = true;
 
-        Ok(Async::Ready(()))
+        Ok(Ready(()))
     }
 }
 
@@ -187,30 +178,24 @@ pub struct Reader(Rc<RefCell<RingBuffer>>);
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        self.0.borrow_mut().unpark();
+        self.0.borrow_mut().wake();
     }
 }
 
-/// Nonblocking `Read` implementation.
-impl Read for Reader {
-    /// Read data from the RingBuffer. The only error this may return is of kind `WouldBlock`.
-    /// When this returns a `WouldBlock` error, the current task is parked and
-    /// gets notified once more data becomes available the buffer.
+impl AsyncRead for Reader {
+    /// Read data from the RingBuffer.
     ///
-    /// This returns only returns `Ok(0)` if either `buf.len() == 0`, `shutdown`
-    /// was called on the writer and all buffered data has been read, or if the
-    /// corresponding Writer has been dropped and no new data will become
-    /// available. If the Reader task is parked while the Writer is dropped, the
-    /// task gets notified.
+    /// This only returns `Ok(Ready(0))` if either `buf.len() == 0`, `poll_close`
+    /// was called on the corresponding `Writer` and all buffered data has been read, or if the
+    /// corresponding `Writer` has been dropped.
     ///
-    /// If a previous call to `write` returned a `WouldBlock` error, the
-    /// corresponding `Writer` is unparked if data was written in this `read`
-    /// call.
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+    /// # Errors
+    /// This never emits an error.
+    fn poll_read(&mut self, cx: &mut Context, buf: &mut [u8]) -> Poll<usize, Error> {
         let mut rb = self.0.borrow_mut();
 
         if buf.len() == 0 {
-            return Ok(0);
+            return Ok(Ready(0));
         }
 
         let capacity = rb.data.capacity();
@@ -219,9 +204,10 @@ impl Read for Reader {
 
         if rb.amount == 0 {
             if Rc::strong_count(&self.0) == 1 || rb.did_shutdown {
-                return Ok(0);
+                return Ok(Ready(0));
             } else {
-                return Err(rb.park());
+                rb.park(cx);
+                return Ok(Pending);
             }
         }
 
@@ -250,475 +236,34 @@ impl Read for Reader {
         debug_assert!(rb.read < end);
         debug_assert!(rb.amount <= capacity);
 
-        rb.unpark();
-        return Ok(read_total);
+        rb.wake();
+        return Ok(Ready(read_total));
     }
 }
 
-impl AsyncRead for Reader {}
-
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind::WouldBlock;
-    use std::cmp::min;
-
-    use quickcheck::{QuickCheck, StdGen, Gen, Arbitrary};
-    use futures::{Future, Async};
-    use futures::future::poll_fn;
-    use void::Void;
-    use rand;
-    use rand::Rng;
-
     use super::*;
 
-    #[derive(Clone, Debug)]
-    struct Nums {
-        items: Vec<usize>,
-    }
-
-    impl Arbitrary for Nums {
-        fn arbitrary<G: Gen>(g: &mut G) -> Self {
-            let size = g.size();
-            let items: Vec<usize> = (0..200).map(|_| g.gen_range(0, size)).collect();
-            Nums { items }
-        }
-    }
-
-    struct WriteAll<'b> {
-        buf_sizes: Vec<usize>,
-        buf: &'b mut Writer,
-        data: Vec<u8>,
-        offset: usize,
-    }
-
-    impl<'b> WriteAll<'b> {
-        fn new(buf_sizes: Vec<usize>, buf: &'b mut Writer) -> WriteAll {
-            WriteAll {
-                buf_sizes,
-                buf,
-                data: (0u8..255).collect(),
-                offset: 0,
-            }
-        }
-
-        fn step(&mut self) -> Option<usize> {
-            let len = self.buf_sizes.pop().unwrap_or(5);
-            match self.buf
-                      .write(&self.data[self.offset..min(self.offset + len, self.data.len())]) {
-                Err(e) => {
-                    if e.kind() == WouldBlock {
-                        return None;
-                    } else {
-                        panic!("RingBuffer returned error other than WouldBlock");
-                    }
-                }
-                Ok(written) => {
-                    self.offset += written;
-                    assert!((min(self.offset + len, self.data.len()) == self.offset) ||
-                            written != 0); // the ring buffer never returns 0 on write unless it was passed a 0-length buffer
-                    return Some(written);
-                }
-            }
-        }
-    }
-
-    impl<'b> Future for WriteAll<'b> {
-        type Item = ();
-        type Error = Void;
-
-        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-            while self.offset < self.data.len() {
-                match self.step() {
-                    None => return Ok(Async::NotReady),
-                    Some(_) => {}
-                }
-            }
-            return Ok(Async::Ready(()));
-        }
-    }
-
-    struct ReadAll<'b, 'd> {
-        buf_sizes: Vec<usize>,
-        buf: &'b mut Reader,
-        data: &'d mut Vec<u8>,
-        offset: usize,
-    }
-
-    impl<'b, 'd> ReadAll<'b, 'd> {
-        fn new(buf_sizes: Vec<usize>,
-               buf: &'b mut Reader,
-               data: &'d mut Vec<u8>)
-               -> ReadAll<'b, 'd> {
-            ReadAll {
-                buf_sizes,
-                buf,
-                data,
-                offset: 0,
-            }
-        }
-
-        fn step(&mut self) -> Option<usize> {
-            let len = self.buf_sizes.pop().unwrap_or(5);
-            let end = self.data.len();
-            match self.buf
-                      .read(&mut self.data[self.offset..min(self.offset + len, end)]) {
-                Err(e) => {
-                    if e.kind() == WouldBlock {
-                        return None;
-                    } else {
-                        panic!("RingBuffer returned error other than WouldBlock");
-                    }
-                }
-                Ok(read) => {
-                    self.offset += read;
-                    assert!((min(self.offset + len, end) == self.offset) || read != 0); // the ring buffer never returns 0 on read unless it was passed a 0-length buffer
-                    return Some(read);
-                }
-            }
-        }
-    }
-
-    impl<'b, 'd> Future for ReadAll<'b, 'd> {
-        type Item = ();
-        type Error = Void;
-
-        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-            while self.offset < self.data.len() {
-                match self.step() {
-                    None => return Ok(Async::NotReady),
-                    Some(_) => {}
-                }
-            }
-            return Ok(Async::Ready(()));
-        }
-    }
-
-    // only works when passing buffers of nonzero length to read/write
-    struct ReadWriteInterleaved<'rb, 'rd, 'wb> {
-        read_all: ReadAll<'rb, 'rd>,
-        write_all: WriteAll<'wb>,
-        blocked: Blocked,
-        done: Done,
-    }
-
-    enum Blocked {
-        Reader,
-        Writer,
-        Neither,
-    }
-
-    #[derive(Eq, PartialEq)]
-    enum Done {
-        Reader,
-        Writer,
-        Neither,
-        Both,
-    }
-
-    impl<'rb, 'rd, 'wb> ReadWriteInterleaved<'rb, 'rd, 'wb> {
-        fn new(r_buf_sizes: Vec<usize>,
-               r_buf: &'rb mut Reader,
-               r_data: &'rd mut Vec<u8>,
-               w_buf_sizes: Vec<usize>,
-               w_buf: &'wb mut Writer)
-               -> ReadWriteInterleaved<'rb, 'rd, 'wb> {
-            ReadWriteInterleaved {
-                read_all: ReadAll::new(r_buf_sizes, r_buf, r_data),
-                write_all: WriteAll::new(w_buf_sizes, w_buf),
-                blocked: Blocked::Neither,
-                done: Done::Neither,
-            }
-        }
-    }
-
-    impl<'rb, 'rd, 'wb> Future for ReadWriteInterleaved<'rb, 'rd, 'wb> {
-        type Item = ();
-        type Error = Void;
-
-        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-            let mut rng = rand::thread_rng();
-
-            loop {
-                match self.done {
-                    Done::Neither => {
-                        match self.blocked {
-                            Blocked::Neither => {
-                                if rng.gen() {
-                                    match self.write_all.step() {
-                                        None => self.blocked = Blocked::Writer,
-                                        Some(_) => {
-                                            if !(self.write_all.offset <
-                                                 self.write_all.data.len()) {
-                                                self.done = Done::Writer;
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    match self.read_all.step() {
-                                        None => self.blocked = Blocked::Reader,
-                                        Some(_) => {
-                                            if !(self.read_all.offset < self.read_all.data.len()) {
-                                                self.done = Done::Reader;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            Blocked::Reader => {
-                                match self.write_all.step() {
-                                    None => self.blocked = Blocked::Writer,
-                                    Some(read) => {
-                                        if read > 0 {
-                                            self.blocked = Blocked::Neither;
-                                        }
-                                        if !(self.write_all.offset < self.write_all.data.len()) {
-                                            self.done = Done::Writer;
-                                        }
-                                    }
-                                }
-                            }
-
-                            Blocked::Writer => {
-                                match self.read_all.step() {
-                                    None => self.blocked = Blocked::Reader,
-                                    Some(read) => {
-                                        if read > 0 {
-                                            self.blocked = Blocked::Neither;
-                                        }
-                                        if !(self.read_all.offset < self.read_all.data.len()) {
-                                            self.done = Done::Reader;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Done::Reader => {
-                        match self.write_all.step() {
-                            None => panic!("should never reach this state"),
-                            Some(_) => {
-                                if !(self.write_all.offset < self.write_all.data.len()) {
-                                    self.done = Done::Both;
-                                }
-                            }
-                        }
-                    }
-
-                    Done::Writer => {
-                        match self.read_all.step() {
-                            None => panic!("should never reach this state"),
-                            Some(_) => {
-                                if !(self.read_all.offset < self.read_all.data.len()) {
-                                    self.done = Done::Both;
-                                }
-                            }
-                        }
-                    }
-
-                    Done::Both => {
-                        return Ok(Async::Ready(()));
-                    }
-                }
-            }
-        }
-    }
+    use futures::FutureExt;
+    use futures::executor::block_on;
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    // Write until 8 bytes have been written, then read until 8 bytes have been
-    // read. Repeat until done, then check that correct bytes have been read.
-    fn test_separate() {
-        let rng = StdGen::new(rand::thread_rng(), 12);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(100);
-        quickcheck.quickcheck(separate as fn(Nums, Nums) -> bool);
-    }
+    fn it_works() {
+        let (writer, reader) = ring_buffer(8);
+        let data: Vec<u8> = (0..255).collect();
 
-    fn separate(buf_sizes_write: Nums, buf_sizes_read: Nums) -> bool {
-        let (mut writer, mut reader) = ring_buffer(8);
-        let mut data: Vec<u8> = (0..255).map(|_| 42).collect();
-        {
-            let write_all = WriteAll::new(buf_sizes_write.items, &mut writer);
-            let read_all = ReadAll::new(buf_sizes_read.items, &mut reader, &mut data);
+        let write_all = writer
+            .write_all(data.clone())
+            .and_then(|(writer, _)| writer.close());
+        let read_all = reader
+            .read_to_end(Vec::with_capacity(256))
+            .map(|(_, read_data)| for (i, byte) in read_data.iter().enumerate() {
+                     assert_eq!(*byte, i as u8);
+                 });
 
-            let (_, _) = write_all.join(read_all).wait().unwrap();
-        }
-
-        for (i, byte) in data.iter().enumerate() {
-            if *byte != (i as u8) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    #[test]
-    // Interleaved reads and writes until done, then check that correct bytes
-    // have been read.
-    fn test_interleaved() {
-        let rng = StdGen::new(rand::thread_rng(), 11);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
-        quickcheck.quickcheck(interleaved as fn(Nums, Nums) -> bool);
-    }
-
-    fn interleaved(buf_sizes_write: Nums, buf_sizes_read: Nums) -> bool {
-        let (mut writer, mut reader) = ring_buffer(8);
-        let mut data: Vec<u8> = (0..255).map(|_| 42).collect();
-        {
-            let _ = ReadWriteInterleaved::new(buf_sizes_read.items,
-                                              &mut reader,
-                                              &mut data,
-                                              buf_sizes_write.items,
-                                              &mut writer)
-                    .wait()
-                    .unwrap();
-        }
-
-        for (i, byte) in data.iter().enumerate() {
-            if *byte != (i as u8) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    #[test]
-    // If the reader has been dropped, writes will return Ok(0) once the buffer
-    // is full.
-    fn test_dropped_reader() {
-        let mut writer;
-        {
-            let (w, _) = ring_buffer(8);
-            writer = w;
-        }
-        assert_eq!(writer.write(&[0, 1, 2, 3, 4]).unwrap(), 5);
-        assert_eq!(writer.write(&[5, 6, 7, 8, 9]).unwrap(), 3);
-        assert_eq!(writer.write(&[8, 9]).unwrap(), 0);
-        assert_eq!(writer.write(&[8, 9]).unwrap(), 0);
-    }
-
-    #[test]
-    // If the reader is dropped while the writer is parked, the writer is
-    // notified and further writes return Ok(0).
-    fn test_dropped_reader_notify() {
-        let mut writer = None;
-        let mut blocked = false;
-        assert_eq!(poll_fn::<(), Void, _>(|| if !blocked {
-                                              let (mut w, mut r) = ring_buffer(8);
-                                              assert_eq!(w.write(&[0, 1, 2, 3, 4, 5, 6, 7])
-                                                             .unwrap(),
-                                                         8);
-                                              let _ = w.write(&[8, 9]).unwrap_err();
-                                              blocked = true;
-                                              writer = Some(w);
-                                              let _ = r.read(&mut []); // use r so that drop does not get moved to an earlier point
-                                              return Ok(Async::NotReady);
-                                          } else {
-                                              let mut w = writer.take().unwrap();
-                                              assert_eq!(w.write(&[8, 9]).unwrap(), 0);
-                                              assert_eq!(w.write(&[8, 9]).unwrap(), 0);
-                                              return Ok(Async::Ready(()));
-                                          })
-                           .wait()
-                           .unwrap(),
-                   ());
-    }
-
-    #[test]
-    // If the writer has been dropped, reads will return Ok(0) once all data
-    // has been read.
-    fn test_dropped_writer() {
-        let mut reader;
-        {
-            let (mut w, r) = ring_buffer(8);
-            assert_eq!(w.write(&[0, 1, 2, 3, 4, 5, 6, 7]).unwrap(), 8);
-            reader = r;
-        }
-        let mut foo = [0u8; 8];
-        assert_eq!(reader.read(&mut foo[0..5]).unwrap(), 5);
-        assert_eq!(reader.read(&mut foo[5..8]).unwrap(), 3);
-        assert_eq!(reader.read(&mut foo[0..8]).unwrap(), 0);
-        assert_eq!(reader.read(&mut foo[0..8]).unwrap(), 0);
-    }
-
-    #[test]
-    // If the writer is dropped while the reader is parked, the reader is
-    // notified and further reads return Ok(0).
-    fn test_dropped_writer_notify() {
-        let mut reader = None;
-        let mut blocked = false;
-        assert_eq!(poll_fn::<(), Void, _>(|| if !blocked {
-                                              let (mut w, mut r) = ring_buffer(8); // must give writer a name, or dropping optimized to an earlier point
-                                              let mut foo = [0u8; 8];
-
-                                              let _ = r.read(&mut foo[0..5]).unwrap_err();
-                                              blocked = true;
-                                              reader = Some(r);
-                                              let _ = w.write(&[]); // use w so that drop does not get moved to an earlier point
-                                              return Ok(Async::NotReady);
-                                          } else {
-                                              let mut r = reader.take().unwrap();
-                                              let mut foo = [0u8; 8];
-
-                                              assert_eq!(r.read(&mut foo[0..5]).unwrap(), 0);
-                                              assert_eq!(r.read(&mut foo[0..5]).unwrap(), 0);
-                                              return Ok(Async::Ready(()));
-                                          })
-                           .wait()
-                           .unwrap(),
-                   ());
-    }
-
-    #[test]
-    // After calling `shutdown` on the writer, reads return Ok(0) once all data has
-    // been read.
-    fn test_shutdown_writer_reads() {
-        let (mut w, mut r) = ring_buffer(8);
-
-        assert_eq!(w.write(&[0, 1, 2, 3, 4, 5]).unwrap(), 6);
-        assert_eq!(w.shutdown().unwrap(), Async::Ready(()));
-
-        let mut foo = [0u8; 8];
-        assert_eq!(r.read(&mut foo[0..4]).unwrap(), 4);
-        assert_eq!(r.read(&mut foo[4..8]).unwrap(), 2);
-        assert_eq!(r.read(&mut foo[6..8]).unwrap(), 0);
-        assert_eq!(r.read(&mut foo[6..8]).unwrap(), 0);
-    }
-
-    #[test]
-    // If `shutdown` is called on the writer while the reader is parked, the reader
-    // is notified and further reads return Ok(0).
-    fn test_shutdown_writer_notify() {
-        let (mut w, mut r) = ring_buffer(8);
-        let mut foo = [0u8; 8];
-        let mut blocked = false;
-
-        assert_eq!(poll_fn::<(), Void, _>(|| if !blocked {
-                                              let _ = r.read(&mut foo[0..5]).unwrap_err();
-                                              blocked = true;
-                                              assert_eq!(w.shutdown().unwrap(), Async::Ready(()));
-                                              return Ok(Async::NotReady);
-                                          } else {
-                                              assert_eq!(r.read(&mut foo[0..5]).unwrap(), 0);
-                                              assert_eq!(r.read(&mut foo[0..5]).unwrap(), 0);
-                                              return Ok(Async::Ready(()));
-                                          })
-                           .wait()
-                           .unwrap(),
-                   ());
-    }
-
-    #[test]
-    // After calling `shutdown` on the writer, further writes return Ok(0).
-    fn test_shutdown_writer_writes() {
-        let (mut w, _) = ring_buffer(8);
-
-        assert_eq!(w.write(&[0, 1, 2, 3]).unwrap(), 4);
-        assert_eq!(w.shutdown().unwrap(), Async::Ready(()));
-        assert_eq!(w.write(&[4, 5, 6, 7]).unwrap(), 0);
-        assert_eq!(w.write(&[4, 5, 6, 7]).unwrap(), 0);
+        assert!(block_on(write_all.join(read_all)).is_ok());
     }
 
     #[test]

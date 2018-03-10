@@ -8,10 +8,8 @@ license = "AGPL-3.0"
 repository = "https://github.com/AljoschaMeyer/async-ringbuffer"
 
 [dependencies]
-tokio-io = "0.1.2"
-futures = "0.1.17"
+futures-core = "0.2.0-alpha"
+futures-io = "0.2.0-alpha"
 
 [dev-dependencies]
-quickcheck = "0.4.1"
-void = "1.0.2"
-rand = "0.3.18"
+futures = "0.2.0-alpha"
