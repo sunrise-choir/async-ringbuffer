@@ -55,7 +55,7 @@ struct RingBuffer {
 
 impl RingBuffer {
     fn park(&mut self, cx: &Context) {
-        self.waker = Some(cx.waker());
+        self.waker = Some(cx.waker().clone());
     }
 
     fn wake(&mut self) {
