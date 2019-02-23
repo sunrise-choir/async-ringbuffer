@@ -1,7 +1,7 @@
 //! An asynchronous, fixed-capacity single-reader single-writer ring buffer that notifies the reader onces data becomes available, and notifies the writer once new space for data becomes available. This is done via the AsyncRead and AsyncWrite traits.
 
 #![deny(missing_docs)]
-#![feature(offset_to)]
+#![feature(ptr_offset_from)]
 
 extern crate futures_core;
 extern crate futures_io;
@@ -65,10 +65,8 @@ impl RingBuffer {
     fn write_ptr(&mut self) -> *mut u8 {
         unsafe {
             let start = self.data.as_mut_slice().as_mut_ptr();
-            let diff = start
-                .offset(self.data.capacity() as isize)
-                .offset_to(self.read.offset(self.amount as isize))
-                .unwrap();
+            let diff = self.read.offset(self.amount as isize)
+                .offset_from(start.offset(self.data.capacity() as isize));
 
             if diff < 0 {
                 self.read.offset(self.amount as isize)
@@ -130,7 +128,7 @@ impl AsyncWrite for Writer {
             rb.amount += write_total;
         } else {
             // wrapping case
-            let distance_we = rb.write_ptr().offset_to(end).unwrap() as usize;
+            let distance_we = unsafe { end.offset_from(rb.write_ptr()) as usize };
             let remaining: usize = write_total - distance_we;
 
             unsafe { copy_nonoverlapping(buf_ptr, rb.write_ptr(), distance_we) };
@@ -222,7 +220,7 @@ impl AsyncRead for Reader {
             rb.amount -= read_total;
         } else {
             // wrapping case
-            let distance_re = rb.read.offset_to(end).unwrap() as usize;
+            let distance_re = unsafe { end.offset_from(rb.read) as usize };
             let remaining: usize = read_total - distance_re;
 
             unsafe { copy_nonoverlapping(rb.read, buf_ptr, distance_re) };
