@@ -1,6 +1,7 @@
 //! An asynchronous, fixed-capacity single-reader single-writer ring buffer that notifies the reader onces data becomes available, and notifies the writer once new space for data becomes available. This is done via the AsyncRead and AsyncWrite traits.
 
 #![deny(missing_docs)]
+#![feature(async_await, await_macro, futures_api)]
 #![feature(ptr_offset_from)]
 
 extern crate futures_core;
@@ -14,10 +15,8 @@ use std::ptr::copy_nonoverlapping;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use futures_io::{AsyncRead, AsyncWrite, Error};
-use futures_core::{Poll, Async};
-use futures_core::task::{Context, Waker};
-use Async::{Ready, Pending};
+use futures_io::{AsyncRead, AsyncWrite, Result};
+use std::task::{Poll, Poll::Ready, Poll::Pending, Waker};
 
 /// Creates a new RingBuffer with the given capacity, and returns a handle for
 /// writing and a handle for reading.
@@ -54,8 +53,8 @@ struct RingBuffer {
 }
 
 impl RingBuffer {
-    fn park(&mut self, cx: &Context) {
-        self.waker = Some(cx.waker().clone());
+    fn park(&mut self, waker: &Waker) {
+        self.waker = Some(waker.clone());
     }
 
     fn wake(&mut self) {
@@ -98,11 +97,11 @@ impl AsyncWrite for Writer {
     ///
     /// # Errors
     /// This never emits an error.
-    fn poll_write(&mut self, cx: &mut Context, buf: &[u8]) -> Poll<usize, Error> {
+    fn poll_write(&mut self, wk: &Waker, buf: &[u8]) -> Poll<Result<usize>> {
         let mut rb = self.0.borrow_mut();
 
         if buf.len() == 0 || rb.did_shutdown {
-            return Ok(Ready(0));
+            return Ready(Ok(0));
         }
 
         let capacity = rb.data.capacity();
@@ -111,10 +110,10 @@ impl AsyncWrite for Writer {
 
         if rb.amount == capacity {
             if Rc::strong_count(&self.0) == 1 {
-                return Ok(Ready(0));
+                return Ready(Ok(0));
             } else {
-                rb.park(cx);
-                return Ok(Pending);
+                rb.park(wk);
+                return Pending;
             }
         }
 
@@ -142,13 +141,13 @@ impl AsyncWrite for Writer {
         debug_assert!(rb.amount <= capacity);
 
         rb.wake();
-        return Ok(Ready(write_total));
+        return Ready(Ok(write_total));
     }
 
     /// # Errors
     /// This never emits an error.
-    fn poll_flush(&mut self, _: &mut Context) -> Poll<(), Error> {
-        Ok(Ready(()))
+    fn poll_flush(&mut self, _: &Waker) -> Poll<Result<()>> {
+        Ready(Ok(()))
     }
 
     /// Once closing is complete, the corresponding reader will always return `Ok(Ready(0))` on
@@ -156,7 +155,7 @@ impl AsyncWrite for Writer {
     ///
     /// # Errors
     /// This never emits an error.
-    fn poll_close(&mut self, _: &mut Context) -> Poll<(), Error> {
+    fn poll_close(&mut self, _: &Waker) -> Poll<Result<()>> {
         let mut rb = self.0.borrow_mut();
 
         if !rb.did_shutdown {
@@ -164,7 +163,7 @@ impl AsyncWrite for Writer {
         }
         rb.did_shutdown = true;
 
-        Ok(Ready(()))
+        Ready(Ok(()))
     }
 }
 
@@ -189,11 +188,11 @@ impl AsyncRead for Reader {
     ///
     /// # Errors
     /// This never emits an error.
-    fn poll_read(&mut self, cx: &mut Context, buf: &mut [u8]) -> Poll<usize, Error> {
+    fn poll_read(&mut self, wk: &Waker, buf: &mut [u8]) -> Poll<Result<usize>> {
         let mut rb = self.0.borrow_mut();
 
         if buf.len() == 0 {
-            return Ok(Ready(0));
+            return Ready(Ok(0));
         }
 
         let capacity = rb.data.capacity();
@@ -202,10 +201,10 @@ impl AsyncRead for Reader {
 
         if rb.amount == 0 {
             if Rc::strong_count(&self.0) == 1 || rb.did_shutdown {
-                return Ok(Ready(0));
+                return Ready(Ok(0));
             } else {
-                rb.park(cx);
-                return Ok(Pending);
+                rb.park(wk);
+                return Pending;
             }
         }
 
@@ -235,33 +234,36 @@ impl AsyncRead for Reader {
         debug_assert!(rb.amount <= capacity);
 
         rb.wake();
-        return Ok(Ready(read_total));
+        return Ready(Ok(read_total));
     }
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
-    use futures::FutureExt;
+    use futures::join;
     use futures::executor::block_on;
     use futures::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn it_works() {
-        let (writer, reader) = ring_buffer(8);
+        let (mut writer, mut reader) = ring_buffer(8);
         let data: Vec<u8> = (0..255).collect();
+        let write_all = async {
+            await!(writer.write_all(&data)).unwrap();
+            await!(writer.close()).unwrap();
+        };
 
-        let write_all = writer
-            .write_all(data.clone())
-            .and_then(|(writer, _)| writer.close());
-        let read_all = reader
-            .read_to_end(Vec::with_capacity(256))
-            .map(|(_, read_data)| for (i, byte) in read_data.iter().enumerate() {
-                     assert_eq!(*byte, i as u8);
-                 });
+        let mut out: Vec<u8> = Vec::with_capacity(256);
+        let read_all = reader.read_to_end(&mut out);
 
-        assert!(block_on(write_all.join(read_all)).is_ok());
+        block_on(async { join!(write_all, read_all) });
+
+        for (i, byte) in out.iter().enumerate() {
+            assert_eq!(*byte, i as u8);
+        }
     }
 
     #[test]

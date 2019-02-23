@@ -6,10 +6,11 @@ description = "A nonblocking spsc ring buffer with fixed capacity."
 readme = "README.md"
 license = "AGPL-3.0"
 repository = "https://github.com/AljoschaMeyer/async-ringbuffer"
+edition = "2018"
 
 [dependencies]
-futures-core-preview = "0.2.0"
-futures-io-preview = "0.2.0"
+futures-core-preview = "0.3.0-alpha.13"
+futures-io-preview = "0.3.0-alpha.13"
 
 [dev-dependencies]
-futures-preview = "0.2.0"
+futures-preview = "0.3.0-alpha.13"
