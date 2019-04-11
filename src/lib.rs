@@ -82,6 +82,14 @@ impl RingBuffer {
 /// and notified once space becomes available.
 pub struct Writer(Rc<RefCell<RingBuffer>>);
 
+impl Writer {
+    /// Returns true if the writer has been closed, and will therefore no longer
+    ///  accept writes.
+    pub fn is_closed(&self) -> bool {
+        self.0.borrow().did_shutdown
+    }
+}
+
 impl Drop for Writer {
     fn drop(&mut self) {
         self.0.borrow_mut().wake();
@@ -173,6 +181,16 @@ impl AsyncWrite for Writer {
 /// and notified once data becomes available.
 pub struct Reader(Rc<RefCell<RingBuffer>>);
 
+impl Reader {
+    /// Returns true if the writer side of the ringbuffer has been closed.
+    /// Reads will continue to produce data as long as there are still unread
+    /// bytes in the ringbuffer.
+    pub fn is_closed(&self) -> bool {
+        self.0.borrow().did_shutdown
+    }
+}
+
+
 impl Drop for Reader {
     fn drop(&mut self) {
         self.0.borrow_mut().wake();
@@ -246,6 +264,7 @@ mod tests {
     use futures::join;
     use futures::executor::block_on;
     use futures::io::{AsyncReadExt, AsyncWriteExt};
+    use futures::task::noop_waker;
 
     #[test]
     fn it_works() {
@@ -278,5 +297,33 @@ mod tests {
     /// Calling `ring_buffer` with capacity (isize::max_value() as usize) + 1 panics
     fn panic_on_capacity_too_large() {
         let _ = ring_buffer((isize::max_value() as usize) + 1);
+    }
+
+    #[test]
+    fn close() {
+        let (mut writer, mut reader) = ring_buffer(8);
+        block_on(async {
+            await!(writer.write_all(&[1,2,3,4,5])).unwrap();
+            assert!(!writer.is_closed());
+            assert!(!reader.is_closed());
+
+            await!(writer.close()).unwrap();
+
+            assert!(writer.is_closed());
+            assert!(reader.is_closed());
+
+            let wk = noop_waker();
+            match writer.poll_write(&wk, &[6,7,8]) {
+                Ready(Ok(0)) => (),
+                _ => panic!()
+            };
+
+            let mut buf = [0; 8];
+            let n = await!(reader.read(&mut buf)).unwrap();
+            assert_eq!(n, 5);
+
+            let n = await!(reader.read(&mut buf)).unwrap();
+            assert_eq!(n, 0);
+        });
     }
 }
