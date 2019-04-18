@@ -10,6 +10,8 @@ extern crate futures_io;
 #[cfg(test)]
 extern crate futures;
 
+use core::pin::Pin;
+use core::task::Context;
 use std::cmp::min;
 use std::ptr::copy_nonoverlapping;
 use std::cell::RefCell;
@@ -105,7 +107,7 @@ impl AsyncWrite for Writer {
     ///
     /// # Errors
     /// This never emits an error.
-    fn poll_write(&mut self, wk: &Waker, buf: &[u8]) -> Poll<Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<Result<usize>> {
         let mut rb = self.0.borrow_mut();
 
         if buf.len() == 0 || rb.did_shutdown {
@@ -120,7 +122,7 @@ impl AsyncWrite for Writer {
             if Rc::strong_count(&self.0) == 1 {
                 return Ready(Ok(0));
             } else {
-                rb.park(wk);
+                rb.park(cx.waker());
                 return Pending;
             }
         }
@@ -154,7 +156,7 @@ impl AsyncWrite for Writer {
 
     /// # Errors
     /// This never emits an error.
-    fn poll_flush(&mut self, _: &Waker) -> Poll<Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context) -> Poll<Result<()>> {
         Ready(Ok(()))
     }
 
@@ -163,7 +165,7 @@ impl AsyncWrite for Writer {
     ///
     /// # Errors
     /// This never emits an error.
-    fn poll_close(&mut self, _: &Waker) -> Poll<Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context) -> Poll<Result<()>> {
         let mut rb = self.0.borrow_mut();
 
         if !rb.did_shutdown {
@@ -206,7 +208,7 @@ impl AsyncRead for Reader {
     ///
     /// # Errors
     /// This never emits an error.
-    fn poll_read(&mut self, wk: &Waker, buf: &mut [u8]) -> Poll<Result<usize>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut [u8]) -> Poll<Result<usize>> {
         let mut rb = self.0.borrow_mut();
 
         if buf.len() == 0 {
@@ -221,7 +223,7 @@ impl AsyncRead for Reader {
             if Rc::strong_count(&self.0) == 1 || rb.did_shutdown {
                 return Ready(Ok(0));
             } else {
-                rb.park(wk);
+                rb.park(cx.waker());
                 return Pending;
             }
         }
@@ -264,7 +266,6 @@ mod tests {
     use futures::join;
     use futures::executor::block_on;
     use futures::io::{AsyncReadExt, AsyncWriteExt};
-    use futures::task::noop_waker;
 
     #[test]
     fn it_works() {
@@ -312,11 +313,8 @@ mod tests {
             assert!(writer.is_closed());
             assert!(reader.is_closed());
 
-            let wk = noop_waker();
-            match writer.poll_write(&wk, &[6,7,8]) {
-                Ready(Ok(0)) => (),
-                _ => panic!()
-            };
+            let r = await!(writer.write_all(&[6, 7, 8]));
+            assert!(r.is_err());
 
             let mut buf = [0; 8];
             let n = await!(reader.read(&mut buf)).unwrap();
