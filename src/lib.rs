@@ -1,10 +1,9 @@
 //! An asynchronous, fixed-capacity single-reader single-writer ring buffer that notifies the reader onces data becomes available, and notifies the writer once new space for data becomes available. This is done via the AsyncRead and AsyncWrite traits.
 
 #![deny(missing_docs)]
-#![feature(async_await, await_macro, futures_api)]
+#![feature(async_await, await_macro)]
 #![feature(ptr_offset_from)]
 
-extern crate futures_core;
 extern crate futures_io;
 
 #[cfg(test)]
@@ -260,12 +259,10 @@ impl AsyncRead for Reader {
 
 #[cfg(test)]
 mod tests {
-
-    use super::*;
-
-    use futures::join;
     use futures::executor::block_on;
     use futures::io::{AsyncReadExt, AsyncWriteExt};
+    use futures::future::join;
+    use super::*;
 
     #[test]
     fn it_works() {
@@ -279,7 +276,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::with_capacity(256);
         let read_all = reader.read_to_end(&mut out);
 
-        block_on(async { join!(write_all, read_all) });
+        block_on(async { await!(join(write_all, read_all)) });
 
         for (i, byte) in out.iter().enumerate() {
             assert_eq!(*byte, i as u8);
