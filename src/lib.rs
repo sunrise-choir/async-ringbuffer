@@ -11,13 +11,13 @@ extern crate futures;
 
 use core::pin::Pin;
 use core::task::Context;
+use std::cell::RefCell;
 use std::cmp::min;
 use std::ptr::copy_nonoverlapping;
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use futures_io::{AsyncRead, AsyncWrite, Result};
-use std::task::{Poll, Poll::Ready, Poll::Pending, Waker};
+use std::task::{Poll, Poll::Pending, Poll::Ready, Waker};
 
 /// Creates a new RingBuffer with the given capacity, and returns a handle for
 /// writing and a handle for reading.
@@ -33,12 +33,12 @@ pub fn ring_buffer(capacity: usize) -> (Writer, Reader) {
     let ptr = data.as_mut_slice().as_mut_ptr();
 
     let rb = Rc::new(RefCell::new(RingBuffer {
-                                      data,
-                                      read: ptr,
-                                      amount: 0,
-                                      waker: None,
-                                      did_shutdown: false,
-                                  }));
+        data,
+        read: ptr,
+        amount: 0,
+        waker: None,
+        did_shutdown: false,
+    }));
 
     (Writer(Rc::clone(&rb)), Reader(rb))
 }
@@ -65,7 +65,9 @@ impl RingBuffer {
     fn write_ptr(&mut self) -> *mut u8 {
         unsafe {
             let start = self.data.as_mut_slice().as_mut_ptr();
-            let diff = self.read.offset(self.amount as isize)
+            let diff = self
+                .read
+                .offset(self.amount as isize)
                 .offset_from(start.offset(self.data.capacity() as isize));
 
             if diff < 0 {
@@ -191,7 +193,6 @@ impl Reader {
     }
 }
 
-
 impl Drop for Reader {
     fn drop(&mut self) {
         self.0.borrow_mut().wake();
@@ -259,10 +260,10 @@ impl AsyncRead for Reader {
 
 #[cfg(test)]
 mod tests {
-    use futures::executor::block_on;
-    use futures::io::{AsyncReadExt, AsyncWriteExt};
-    use futures::future::join;
     use super::*;
+    use futures::executor::block_on;
+    use futures::future::join;
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn it_works() {
@@ -301,7 +302,7 @@ mod tests {
     fn close() {
         let (mut writer, mut reader) = ring_buffer(8);
         block_on(async {
-            writer.write_all(&[1,2,3,4,5]).await.unwrap();
+            writer.write_all(&[1, 2, 3, 4, 5]).await.unwrap();
             assert!(!writer.is_closed());
             assert!(!reader.is_closed());
 
