@@ -1,7 +1,7 @@
 //! An asynchronous, fixed-capacity single-reader single-writer ring buffer that notifies the reader onces data becomes available, and notifies the writer once new space for data becomes available. This is done via the AsyncRead and AsyncWrite traits.
 
 #![deny(missing_docs)]
-#![feature(async_await, await_macro)]
+#![feature(async_await)]
 #![feature(ptr_offset_from)]
 
 extern crate futures_io;
@@ -269,14 +269,14 @@ mod tests {
         let (mut writer, mut reader) = ring_buffer(8);
         let data: Vec<u8> = (0..255).collect();
         let write_all = async {
-            await!(writer.write_all(&data)).unwrap();
-            await!(writer.close()).unwrap();
+            writer.write_all(&data).await.unwrap();
+            writer.close().await.unwrap();
         };
 
         let mut out: Vec<u8> = Vec::with_capacity(256);
         let read_all = reader.read_to_end(&mut out);
 
-        block_on(async { await!(join(write_all, read_all)) });
+        block_on(async { join(write_all, read_all).await });
 
         for (i, byte) in out.iter().enumerate() {
             assert_eq!(*byte, i as u8);
@@ -301,23 +301,23 @@ mod tests {
     fn close() {
         let (mut writer, mut reader) = ring_buffer(8);
         block_on(async {
-            await!(writer.write_all(&[1,2,3,4,5])).unwrap();
+            writer.write_all(&[1,2,3,4,5]).await.unwrap();
             assert!(!writer.is_closed());
             assert!(!reader.is_closed());
 
-            await!(writer.close()).unwrap();
+            writer.close().await.unwrap();
 
             assert!(writer.is_closed());
             assert!(reader.is_closed());
 
-            let r = await!(writer.write_all(&[6, 7, 8]));
+            let r = writer.write_all(&[6, 7, 8]).await;
             assert!(r.is_err());
 
             let mut buf = [0; 8];
-            let n = await!(reader.read(&mut buf)).unwrap();
+            let n = reader.read(&mut buf).await.unwrap();
             assert_eq!(n, 5);
 
-            let n = await!(reader.read(&mut buf)).unwrap();
+            let n = reader.read(&mut buf).await.unwrap();
             assert_eq!(n, 0);
         });
     }

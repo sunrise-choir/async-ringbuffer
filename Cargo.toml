@@ -9,7 +9,7 @@ repository = "https://github.com/AljoschaMeyer/async-ringbuffer"
 edition = "2018"
 
 [dependencies]
-futures-io-preview = "0.3.0-alpha.15"
+futures-io-preview = "0.3.0-alpha.16"
 
 [dev-dependencies]
-futures-preview = "0.3.0-alpha.15"
+futures-preview = "0.3.0-alpha.16"
