@@ -4,6 +4,6 @@ An asynchronous, fixed-capacity single-reader single-writer ring buffer that not
 
 This crate is to `AsyncRead` and `AsyncWrite` what `futures::unsync::spsc` is to `Stream` and `Sink` (except that `futures::unsync::spsc` doesn't currently exist).
 
-Note: this crate requires a recent nightly rust (tested on 2019-04-30).
+Note: this crate requires a recent nightly rust (tested on 2019-05-17).
 
 [API documentation](https://docs.rs/async-ringbuffer/)
