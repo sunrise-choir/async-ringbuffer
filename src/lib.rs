@@ -59,7 +59,7 @@ impl RingBuffer {
     }
 
     fn wake(&mut self) {
-        self.waker.take().map(|w| w.wake());
+        if let Some(w) = self.waker.take() { w.wake() }
     }
 
     fn write_ptr(&mut self) -> *mut u8 {
@@ -67,11 +67,11 @@ impl RingBuffer {
             let start = self.data.as_mut_slice().as_mut_ptr();
             let diff = self
                 .read
-                .offset(self.amount as isize)
-                .offset_from(start.offset(self.data.capacity() as isize));
+                .add(self.amount)
+                .offset_from(start.add(self.data.capacity()));
 
             if diff < 0 {
-                self.read.offset(self.amount as isize)
+                self.read.add(self.amount)
             } else {
                 start.offset(diff)
             }
@@ -111,13 +111,13 @@ impl AsyncWrite for Writer {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<Result<usize>> {
         let mut rb = self.0.borrow_mut();
 
-        if buf.len() == 0 || rb.did_shutdown {
+        if buf.is_empty() || rb.did_shutdown {
             return Ready(Ok(0));
         }
 
         let capacity = rb.data.capacity();
         let start = rb.data.as_mut_slice().as_mut_ptr();
-        let end = unsafe { start.offset(capacity as isize) }; // end itself is 1 byte outside the buffer
+        let end = unsafe { start.add(capacity) }; // end itself is 1 byte outside the buffer
 
         if rb.amount == capacity {
             if Rc::strong_count(&self.0) == 1 {
@@ -131,7 +131,7 @@ impl AsyncWrite for Writer {
         let buf_ptr = buf.as_ptr();
         let write_total = min(buf.len(), capacity - rb.amount);
 
-        if (unsafe { rb.write_ptr().offset(write_total as isize) } as *const u8) < end {
+        if (unsafe { rb.write_ptr().add(write_total) } as *const u8) < end {
             // non-wrapping case
             unsafe { copy_nonoverlapping(buf_ptr, rb.write_ptr(), write_total) };
 
@@ -142,7 +142,7 @@ impl AsyncWrite for Writer {
             let remaining: usize = write_total - distance_we;
 
             unsafe { copy_nonoverlapping(buf_ptr, rb.write_ptr(), distance_we) };
-            unsafe { copy_nonoverlapping(buf_ptr.offset(distance_we as isize), start, remaining) };
+            unsafe { copy_nonoverlapping(buf_ptr.add(distance_we), start, remaining) };
 
             rb.amount += write_total;
         }
@@ -152,7 +152,7 @@ impl AsyncWrite for Writer {
         debug_assert!(rb.amount <= capacity);
 
         rb.wake();
-        return Ready(Ok(write_total));
+        Ready(Ok(write_total))
     }
 
     /// # Errors
@@ -211,13 +211,13 @@ impl AsyncRead for Reader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut [u8]) -> Poll<Result<usize>> {
         let mut rb = self.0.borrow_mut();
 
-        if buf.len() == 0 {
+        if buf.is_empty() {
             return Ready(Ok(0));
         }
 
         let capacity = rb.data.capacity();
         let start = rb.data.as_mut_slice().as_mut_ptr();
-        let end = unsafe { start.offset(capacity as isize) }; // end itself is 1 byte outside the buffer
+        let end = unsafe { start.add(capacity) }; // end itself is 1 byte outside the buffer
 
         if rb.amount == 0 {
             if Rc::strong_count(&self.0) == 1 || rb.did_shutdown {
@@ -231,11 +231,11 @@ impl AsyncRead for Reader {
         let buf_ptr = buf.as_mut_ptr();
         let read_total = min(buf.len(), rb.amount);
 
-        if (unsafe { rb.read.offset(read_total as isize) } as *const u8) < end {
+        if (unsafe { rb.read.add(read_total) } as *const u8) < end {
             // non-wrapping case
             unsafe { copy_nonoverlapping(rb.read, buf_ptr, read_total) };
 
-            rb.read = unsafe { rb.read.offset(read_total as isize) };
+            rb.read = unsafe { rb.read.add(read_total) };
             rb.amount -= read_total;
         } else {
             // wrapping case
@@ -243,9 +243,9 @@ impl AsyncRead for Reader {
             let remaining: usize = read_total - distance_re;
 
             unsafe { copy_nonoverlapping(rb.read, buf_ptr, distance_re) };
-            unsafe { copy_nonoverlapping(start, buf_ptr.offset(distance_re as isize), remaining) };
+            unsafe { copy_nonoverlapping(start, buf_ptr.add(distance_re), remaining) };
 
-            rb.read = unsafe { start.offset(remaining as isize) };
+            rb.read = unsafe { start.add(remaining) };
             rb.amount -= read_total;
         }
 
@@ -254,7 +254,7 @@ impl AsyncRead for Reader {
         debug_assert!(rb.amount <= capacity);
 
         rb.wake();
-        return Ready(Ok(read_total));
+        Ready(Ok(read_total))
     }
 }
 
