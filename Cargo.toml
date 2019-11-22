@@ -1,6 +1,6 @@
 [package]
 name = "async-ringbuffer"
-version = "0.5.1"
+version = "0.5.2"
 authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "A nonblocking spsc ring buffer with fixed capacity."
 readme = "README.md"
@@ -9,7 +9,7 @@ repository = "https://github.com/sunrise-choir/async-ringbuffer"
 edition = "2018"
 
 [dependencies]
-futures-io-preview = "0.3.0-alpha.16"
+futures-io = "0.3.1"
 
 [dev-dependencies]
-futures-preview = "0.3.0-alpha.16"
+futures = "0.3.1"

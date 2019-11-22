@@ -1,7 +1,6 @@
 //! An asynchronous, fixed-capacity single-reader single-writer ring buffer that notifies the reader onces data becomes available, and notifies the writer once new space for data becomes available. This is done via the AsyncRead and AsyncWrite traits.
 
 #![deny(missing_docs)]
-#![feature(async_await)]
 #![feature(ptr_offset_from)]
 
 extern crate futures_io;
