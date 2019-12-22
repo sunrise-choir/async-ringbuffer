@@ -1,7 +1,6 @@
 //! An asynchronous, fixed-capacity single-reader single-writer ring buffer that notifies the reader onces data becomes available, and notifies the writer once new space for data becomes available. This is done via the AsyncRead and AsyncWrite traits.
 
 #![deny(missing_docs)]
-#![feature(ptr_offset_from)]
 
 extern crate futures_io;
 
@@ -52,6 +51,13 @@ struct RingBuffer {
     did_shutdown: bool,
 }
 
+fn offset_from<T>(x: *const T, other: *const T) -> isize where T: Sized {
+    let size = std::mem::size_of::<T>();
+    assert!(size != 0);
+    let diff = (x as isize).wrapping_sub(other as isize);
+    diff / size as isize
+}
+
 impl RingBuffer {
     fn park(&mut self, waker: &Waker) {
         self.waker = Some(waker.clone());
@@ -64,10 +70,8 @@ impl RingBuffer {
     fn write_ptr(&mut self) -> *mut u8 {
         unsafe {
             let start = self.data.as_mut_slice().as_mut_ptr();
-            let diff = self
-                .read
-                .add(self.amount)
-                .offset_from(start.add(self.data.capacity()));
+            let diff = offset_from(self.read.add(self.amount),
+				   start.add(self.data.capacity()));
 
             if diff < 0 {
                 self.read.add(self.amount)
@@ -137,7 +141,7 @@ impl AsyncWrite for Writer {
             rb.amount += write_total;
         } else {
             // wrapping case
-            let distance_we = unsafe { end.offset_from(rb.write_ptr()) as usize };
+            let distance_we = offset_from(end, rb.write_ptr()) as usize;
             let remaining: usize = write_total - distance_we;
 
             unsafe { copy_nonoverlapping(buf_ptr, rb.write_ptr(), distance_we) };
@@ -238,7 +242,7 @@ impl AsyncRead for Reader {
             rb.amount -= read_total;
         } else {
             // wrapping case
-            let distance_re = unsafe { end.offset_from(rb.read) as usize };
+            let distance_re = offset_from(end, rb.read) as usize;
             let remaining: usize = read_total - distance_re;
 
             unsafe { copy_nonoverlapping(rb.read, buf_ptr, distance_re) };
@@ -276,7 +280,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::with_capacity(256);
         let read_all = reader.read_to_end(&mut out);
 
-        block_on(async { join(write_all, read_all).await });
+        block_on(async { join(write_all, read_all).await.1.unwrap() });
 
         for (i, byte) in out.iter().enumerate() {
             assert_eq!(*byte, i as u8);
