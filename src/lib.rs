@@ -51,7 +51,10 @@ struct RingBuffer {
     did_shutdown: bool,
 }
 
-fn offset_from<T>(x: *const T, other: *const T) -> isize where T: Sized {
+fn offset_from<T>(x: *const T, other: *const T) -> isize
+where
+    T: Sized,
+{
     let size = std::mem::size_of::<T>();
     assert!(size != 0);
     let diff = (x as isize).wrapping_sub(other as isize);
@@ -64,14 +67,15 @@ impl RingBuffer {
     }
 
     fn wake(&mut self) {
-        if let Some(w) = self.waker.take() { w.wake() }
+        if let Some(w) = self.waker.take() {
+            w.wake()
+        }
     }
 
     fn write_ptr(&mut self) -> *mut u8 {
         unsafe {
             let start = self.data.as_mut_slice().as_mut_ptr();
-            let diff = offset_from(self.read.add(self.amount),
-				   start.add(self.data.capacity()));
+            let diff = offset_from(self.read.add(self.amount), start.add(self.data.capacity()));
 
             if diff < 0 {
                 self.read.add(self.amount)
