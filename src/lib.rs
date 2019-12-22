@@ -17,6 +17,9 @@ use std::rc::Rc;
 use futures_io::{AsyncRead, AsyncWrite, Result};
 use std::task::{Poll, Poll::Pending, Poll::Ready, Waker};
 
+mod duplex;
+pub use duplex::Duplex;
+
 /// Creates a new RingBuffer with the given capacity, and returns a handle for
 /// writing and a handle for reading.
 ///
