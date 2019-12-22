@@ -1,6 +1,6 @@
 [package]
 name = "async-ringbuffer"
-version = "0.5.4"
+version = "0.5.5"
 authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "A nonblocking spsc ring buffer with fixed capacity."
 readme = "README.md"

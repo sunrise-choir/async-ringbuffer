@@ -21,6 +21,13 @@ impl Duplex {
 
         (Duplex { r: a_r, w: b_w }, Duplex { r: b_r, w: a_w })
     }
+
+    /// Split duplex AsyncRead + AsyncWrite stream into separate
+    /// (AsyncRead, AsyncWrite) halves.
+    pub fn split(self) -> (Reader, Writer) {
+        let Duplex { r, w } = self;
+        (r, w)
+    }
 }
 
 impl AsyncRead for Duplex {
@@ -66,6 +73,16 @@ mod tests {
             server.write(&[6, 7, 8, 9, 10]).await.unwrap();
             client.read(&mut buf).await.unwrap();
             assert_eq!(&buf, &[6, 7, 8, 9, 10]);
+
+            let mut buf = [0; 3];
+            let (mut sr, mut sw) = server.split();
+            sw.write(&[1, 2, 3]).await.unwrap();
+            client.read(&mut buf).await.unwrap();
+            assert_eq!(&buf, &[1, 2, 3]);
+
+            client.write(&[3, 2, 1]).await.unwrap();
+	    sr.read(&mut buf).await.unwrap();
+	    assert_eq!(&buf, &[3, 2, 1]);
         });
     }
 }
